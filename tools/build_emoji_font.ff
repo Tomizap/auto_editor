@@ -1,0 +1,90 @@
+#!fontforge
+
+# ============================================================
+# Create new font
+# ============================================================
+
+New()
+SetFontNames("EmojiInline", "EmojiInline", "EmojiInline")
+
+# IMPORTANT: enable Unicode encoding
+Reencode("unicode")
+
+# Font metrics (OK for libass / subtitles)
+EM = 1000
+Ascent = 800
+Descent = 200
+
+# Base directory for Twemoji PNGs
+TWEMOJI = "assets/twemoji/"
+
+# ============================================================
+# PUA glyphs (E001 – E00A)
+# ============================================================
+
+# ⚠️ important / attention
+Select(0xE001)
+Clear()
+Import(TWEMOJI + "26a0.png")
+SetWidth(1000)
+
+# ❌ erreur / problème
+Select(0xE002)
+Clear()
+Import(TWEMOJI + "274c.png")
+SetWidth(1000)
+
+# 💡 astuce / conseil
+Select(0xE003)
+Clear()
+Import(TWEMOJI + "1f4a1.png")
+SetWidth(1000)
+
+# 💰 argent
+Select(0xE004)
+Clear()
+Import(TWEMOJI + "1f4b0.png")
+SetWidth(1000)
+
+# 🤫 secret
+Select(0xE005)
+Clear()
+Import(TWEMOJI + "1f92b.png")
+SetWidth(1000)
+
+# ⚡ rapide
+Select(0xE006)
+Clear()
+Import(TWEMOJI + "26a1.png")
+SetWidth(1000)
+
+# ✅ simple
+Select(0xE007)
+Clear()
+Import(TWEMOJI + "2705.png")
+SetWidth(1000)
+
+# 🔥 efficace
+Select(0xE008)
+Clear()
+Import(TWEMOJI + "1f525.png")
+SetWidth(1000)
+
+# 💼 business
+Select(0x1F4BC)
+Clear()
+Import(TWEMOJI + "1f4bc.png")
+SetWidth(1000)
+
+# 📧 email / mail
+Select(0xE00A)
+Clear()
+Import(TWEMOJI + "1f4e7.png")
+SetWidth(1000)
+
+# ============================================================
+# Generate font
+# ============================================================
+
+Generate("assets/fonts/EmojiInline.ttf")
+Quit()

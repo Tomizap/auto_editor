@@ -1,0 +1,13 @@
+env
+venv
+input/*
+output/*
+tmp/*
+hf_cache_clean/
+assets/twemoji/*
+assets/fonts/*
+__pycache__/
+modules/__pycache__/
+.hf_home/
+.ipynb_checkpoints/
+.venv-backups/
