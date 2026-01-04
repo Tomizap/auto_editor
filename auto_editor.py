@@ -4,17 +4,15 @@ import subprocess
 from pathlib import Path
 from typing import List, Tuple
 
+from modules.input_concat import concat_folder_videos
 from modules.video_normalize import normalize_video
 from modules.audio_vad import extract_wav_mono16k, vad_segments
-from modules.ffmpeg_utils import (
-    cut_segment, 
-    concat_segments_single_pass
-) 
+from modules.ffmpeg_utils import cut_segment, concat_segments_single_pass
 from modules.generate_karaoke_ass import generate_karaoke_ass_tiktok_punchy
 from modules.stt import transcribe_with_words
 from modules.gaze_filter import refine_segments_by_gaze, GazeFilterConfig
 from modules.restart_filter import detect_restarts
-from modules.filler_filter import detect_fillers  
+from modules.filler_filter import detect_fillers
 
 
 # =============================================================================
@@ -37,23 +35,33 @@ TMP_DIR.mkdir(exist_ok=True)
 DEVICE = "cuda"
 MODEL_NAME = "medium"
 
-MAX_OUTPUT_SECONDS = 180.0
-
 TARGET_W = 1080
 TARGET_H = 1920
 
 GAZE_CFG = GazeFilterConfig(
-    preset="strict",
+    # Sampling
     sample_fps=4.0,
-    min_stable_s=0.30,
-    gap_merge_s=0.40,
-    entry_guard_s=0.30,
-    entry_score_min=0.65,
-    entry_max_bad_frames=2,
-    entry_cooldown_s=0.32,
-    exit_guard_s=0.45,
-    exit_score_min=0.70,
-    exit_max_bad_frames=2,
+
+    # Geometry — permissive (retours caméra fréquents)
+    yaw_max_deg=40.0,
+    pitch_min_deg=-38.0,
+    pitch_max_deg=28.0,
+
+    # Motion — clé pour détecter la lecture
+    max_yaw_speed_deg_s=120.0,
+    max_pitch_speed_deg_s=135.0,
+
+    # Temporal logic — très important
+    min_valid_duration_s=0.15,     # on accepte des regards caméra courts
+    max_invalid_gap_s=0.55,         # on tolère la lecture brève
+    min_segment_duration_s=0.50,    # sécurité anti micro-cuts
+
+    # Guards — soft
+    entry_grace_s=0.35,
+    exit_grace_s=0.45,
+
+    # Merge
+    merge_gap_s=0.45,
 )
 
 
@@ -80,51 +88,63 @@ def count_words(aligned: dict) -> int:
     return sum(len(s.get("words", [])) for s in aligned.get("segments", []))
 
 
+def is_valid_video(path: Path) -> bool:
+    try:
+        subprocess.run(
+            ["ffmpeg", "-v", "error", "-i", str(path), "-f", "null", "-"],
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL,
+            check=True,
+        )
+        return True
+    except subprocess.CalledProcessError:
+        return False
+
+
 # =============================================================================
-# PROCESS ONE VIDEO
+# PROCESS PROJECT
 # =============================================================================
 
-def process_one(video_path: Path) -> None:
-    original_stem = video_path.stem
+def process_project(
+    video_path: Path,
+    project_name: str,
+) -> None:
 
-    log_header(f"🎬 PROCESSING VIDEO: {video_path.name}")
+    log_header(f"🎬 PROCESSING PROJECT: {project_name}")
 
-    work = TMP_DIR / original_stem
-    if work.exists():
-        # print("🧹 Cleaning temp directory")
-        # shutil.rmtree(work)
-        pass
-    else:
-        work.mkdir(parents=True)
+    work = TMP_DIR / project_name
+    work.mkdir(parents=True, exist_ok=True)
 
     # -------------------------------------------------------------------------
-    # 0) NORMALIZE VIDEO
+    # 1) NORMALIZE
     # -------------------------------------------------------------------------
     t0 = _now()
     normalized = work / "normalized.mp4"
-    if normalized.exists():
+
+    if normalized.exists() and is_valid_video(normalized):
         print("▶ Already Cache Normalize video")
     else:
         print("▶ Normalize video")
         normalize_video(str(video_path), str(normalized))
-    log_step("Normalize video", t0)
 
+    log_step("Normalize video", t0)
     video_path = normalized
 
     # -------------------------------------------------------------------------
-    # 1) EXTRACT AUDIO (FOR VAD + FIRST STT)
+    # 2) EXTRACT AUDIO (VAD)
     # -------------------------------------------------------------------------
     t0 = _now()
     wav = work / "audio.wav"
-    print("▶ Extract audio (mono / 16kHz) [for VAD + cuts]")
+    print("▶ Extract audio (mono / 16kHz)")
     extract_wav_mono16k(str(video_path), str(wav))
     log_step("Extract audio", t0)
 
     # -------------------------------------------------------------------------
-    # 2) VAD
+    # 3) VAD
     # -------------------------------------------------------------------------
     t0 = _now()
     print("▶ Voice Activity Detection")
+
     segments = vad_segments(
         wav_path=str(wav),
         aggressiveness=3,
@@ -134,11 +154,9 @@ def process_one(video_path: Path) -> None:
         merge_gap_ms=250,
     )
 
-    # Compensation audio → video
-    VAD_TIME_BIAS_S = 0.09
-    segments = [(max(0.0, s - VAD_TIME_BIAS_S), e) for s, e in segments]
+    segments = [(max(0.0, s - 0.09), e) for s, e in segments]
 
-    print(f"  • {len(segments)} segment(s) detected after VAD")
+    print(f"  • {len(segments)} segment(s)")
     log_step("VAD", t0)
 
     if not segments:
@@ -146,73 +164,76 @@ def process_one(video_path: Path) -> None:
         return
 
     # -------------------------------------------------------------------------
-    # 3) GAZE FILTER
+    # 4) GAZE FILTER
     # -------------------------------------------------------------------------
     t0 = _now()
-    print(f"▶ Gaze filtering (preset={GAZE_CFG.preset})")
+    print("▶ Gaze filtering")
+
     segments = refine_segments_by_gaze(
         video_path=str(video_path),
         segments=segments,
         cfg=GAZE_CFG,
     )
-    print(f"  • {len(segments)} segment(s) after gaze filter")
+
+    print(f"  • {len(segments)} segment(s)")
     log_step("Gaze filter", t0)
 
     if not segments:
-        print("⚠ All segments removed by gaze filter → skip")
         return
 
     # -------------------------------------------------------------------------
-    # 4) STT #1 (ONCE) — used ONLY to refine cuts (restarts/fillers)
+    # 5) STT #1
     # -------------------------------------------------------------------------
     t0 = _now()
-    print("▶ STT #1 (word-level) [for cut refinement only]")
+    print("▶ STT #1 (cut refinement)")
+
     stt = transcribe_with_words(
         audio_path=str(wav),
         device=DEVICE,
         model_name=MODEL_NAME,
     )
-    all_words = [w for seg in stt.get("segments", []) for w in seg.get("words", [])]
-    print(f"  • stt words: {len(all_words)}")
+
+    all_words = [
+        w for seg in stt.get("segments", [])
+        for w in seg.get("words", [])
+    ]
+
     log_step("STT #1", t0)
 
     # -------------------------------------------------------------------------
-    # 5) RESTART + FILLER FILTER
+    # 6) RESTART + FILLER FILTER
     # -------------------------------------------------------------------------
     t0 = _now()
-    print("▶ Filtering restarts & fillers")
+    print("▶ Restart & filler filtering")
 
     clean_segments: List[Tuple[float, float]] = []
 
     for (start, end) in segments:
         seg_words = [w for w in all_words if start <= w["start"] <= end]
 
-        restart_cuts = detect_restarts(seg_words)
-        filler_cuts = detect_fillers(seg_words)
-        cuts = restart_cuts + filler_cuts
+        cuts = detect_restarts(seg_words) + detect_fillers(seg_words)
 
         if cuts:
-            last_cut_end = max(c[1] for c in cuts)
-            if last_cut_end < end:
-                clean_segments.append((last_cut_end, end))
+            last = max(c[1] for c in cuts)
+            if last < end:
+                clean_segments.append((last, end))
         else:
             clean_segments.append((start, end))
 
     segments = clean_segments
-    print(f"  • {len(segments)} segment(s) after cleanup")
-    log_step("Restart & filler filtering", t0)
+    log_step("Restart & filler filter", t0)
 
     if not segments:
-        print("⚠ No segments after cleanup → skip")
         return
 
     # -------------------------------------------------------------------------
-    # 6) CONCAT DIRECT (ONE PASS) ✅
+    # 7) ONE-PASS CONCAT
     # -------------------------------------------------------------------------
     t0 = _now()
-    print("▶ One-pass trim+concat (fast)")
-    
+    print("▶ One-pass trim+concat")
+
     concat_mp4 = work / "concat.mp4"
+
     concat_segments_single_pass(
         src=str(video_path),
         segments=segments,
@@ -221,61 +242,53 @@ def process_one(video_path: Path) -> None:
         target_h=TARGET_H,
         prefer_nvenc=True,
     )
-    
-    # Recompute total from segments (accurate)
-    total = sum((e - s) for s, e in segments)
-    print(f"  • total≈{total:.2f}s")
+
     log_step("One-pass concat", t0)
 
     # -------------------------------------------------------------------------
-    # 8) AUDIO FROM CONCAT (SOURCE OF TRUTH FOR SUBTITLES)
+    # 8) STT #2 (SUBTITLES)
     # -------------------------------------------------------------------------
     t0 = _now()
-    print("▶ Extract audio from CONCAT (mono / 16kHz) [SUBTITLES SOURCE OF TRUTH]")
     wav_concat = work / "audio_concat.wav"
     extract_wav_mono16k(str(concat_mp4), str(wav_concat))
-    log_step("Extract concat audio", t0)
 
-    # -------------------------------------------------------------------------
-    # 9) STT #2 ON CONCAT (THIS DRIVES SUBTITLES)
-    # -------------------------------------------------------------------------
-    t0 = _now()
-    print("▶ STT #2 on CONCAT (word-level) [SUBTITLES SOURCE OF TRUTH]")
     stt_concat = transcribe_with_words(
         audio_path=str(wav_concat),
         device=DEVICE,
-        model_name=MODEL_NAME,  # mets "small" si tu veux accélérer
+        model_name=MODEL_NAME,
     )
-    print(f"  • concat stt words: {count_words(stt_concat)}")
-    log_step("STT #2 (concat)", t0)
+
+    log_step("STT #2", t0)
 
     # -------------------------------------------------------------------------
-    # 8) Generate Subtitles
+    # 9) SUBTITLES
     # -------------------------------------------------------------------------
     t0 = _now()
-    print("▶ Generate Subtitles")
-    
-    ass_path = work / "subs.ass" 
+    ass_path = work / "subs.ass"
+
     generate_karaoke_ass_tiktok_punchy(
         aligned=stt_concat,
         out_ass_path=ass_path,
     )
-    log_step("Generate Subtitles", t0)
-    
+
+    log_step("Generate subtitles", t0)
+
     # -------------------------------------------------------------------------
-    # 8) FINAL RENDER — DRAW TEXT (FAST, GPU)
+    # 10) FINAL RENDER
     # -------------------------------------------------------------------------
-    
     t0 = _now()
-    print("▶ Final Output")
-    
-    final_out = OUTPUT_DIR / f"{original_stem}_final.mp4"
-    
+    print("▶ Final render")
+
+    project_out = OUTPUT_DIR / project_name
+    project_out.mkdir(parents=True, exist_ok=True)
+
+    final_out = project_out / f"{project_name}_final.mp4"
+
     subprocess.run([
         "ffmpeg", "-y",
         "-i", str(concat_mp4),
         "-vf", f"subtitles={ass_path}:fontsdir=assets/fonts",
-        "-c:v", "h264_nvenc", 
+        "-c:v", "h264_nvenc",
         "-preset", "p5",
         "-cq", "19",
         "-pix_fmt", "yuv420p",
@@ -284,9 +297,9 @@ def process_one(video_path: Path) -> None:
         str(final_out),
     ], check=True)
 
-    
     log_step("Final render", t0)
     print(f"\n✅ DONE → {final_out}")
+
 
 # =============================================================================
 # MAIN
@@ -295,22 +308,39 @@ def process_one(video_path: Path) -> None:
 def main():
     print("\n🚀 AUTO_EDITOR STARTED\n")
 
-    videos = [
+    projects = [
         p for p in INPUT_DIR.iterdir()
-        if p.is_file() and p.suffix.lower() in {".mp4", ".mov", ".mkv"}
+        if p.is_dir() and not p.name.startswith(".")
     ]
 
-    if not videos:
-        print("⚠ No videos found in input/")
+    if not projects:
+        print("⚠ No valid project folders found in input/")
         return
 
-    print(f"📁 Found {len(videos)} video(s)")
+    print(f"📁 Found {len(projects)} project(s)")
 
-    for v in videos:
+    for project in projects:
         try:
-            process_one(v)
+            t0 = _now()
+
+            input_video = concat_folder_videos(
+                folder=project,
+                out_dir=TMP_DIR / "_input_concat"
+            )
+
+            log_step("Input concat", t0)
+
+            process_project(
+                video_path=input_video,
+                project_name=project.name,
+            )
+
+        except RuntimeError:
+            print(f"\n❌ ERROR on project {project.name}")
+            continue
+
         except Exception:
-            print(f"\n❌ ERROR on {v.name}")
+            print(f"\n❌ ERROR on project {project.name}")
             raise
 
 

@@ -1,184 +1,146 @@
 from dataclasses import dataclass
-from typing import List, Tuple, Literal
+from typing import List, Tuple
 import math
 import cv2
 import mediapipe as mp
-
-
-Preset = Literal["soft", "normal", "strict"]
+from mediapipe.tasks import python
+from mediapipe.tasks.python import vision
 
 
 @dataclass
 class GazeFilterConfig:
-    preset: Preset = "normal"
-    sample_fps: float = 6.0
+    sample_fps: float = 4.0
 
-    min_stable_s: float = 0.40
-    gap_merge_s: float = 0.40
+    yaw_max_deg: float = 40.0
+    pitch_min_deg: float = -30.0
+    pitch_max_deg: float = 22.0
 
-    # ENTRY GUARD
-    entry_guard_s: float = 0.35
-    entry_score_min: float = 0.60
-    entry_max_bad_frames: int = 2
+    max_yaw_speed_deg_s: float = 180.0
+    max_pitch_speed_deg_s: float = 160.0
 
-    # 🔑 NEW: cooldown après fuite de regard
-    entry_cooldown_s: float = 0.35
+    min_valid_duration_s: float = 0.35
+    max_invalid_gap_s: float = 0.45
+    min_segment_duration_s: float = 0.6
 
-    # EXIT GUARD
-    exit_guard_s: float = 0.45
-    exit_score_min: float = 0.70
-    exit_max_bad_frames: int = 2
+    entry_grace_s: float = 0.30
+    exit_grace_s: float = 0.40
 
-
-PRESETS = {
-    "soft": {
-        "score_min": 0.45,
-        "yaw_max": 42,
-        "pitch_min": -38,
-        "pitch_max": 26,
-        "yaw_speed_max": 200,
-        "pitch_speed_max": 180,
-        "speed_penalty": 0.45,
-    },
-    "normal": {
-        "score_min": 0.55,
-        "yaw_max": 32,
-        "pitch_min": -26,
-        "pitch_max": 18,
-        "yaw_speed_max": 150,
-        "pitch_speed_max": 130,
-        "speed_penalty": 0.30,
-    },
-    "strict": {
-        "score_min": 0.60,
-        "yaw_max": 30,
-        "pitch_min": -24,
-        "pitch_max": 16,
-        "yaw_speed_max": 110,
-        "pitch_speed_max": 120,
-        "speed_penalty": 0.28,
-    },
-}
+    merge_gap_s: float = 0.40
 
 
-def refine_segments_by_gaze(video_path: str,
-                            segments: List[Tuple[float, float]],
-                            cfg: GazeFilterConfig) -> List[Tuple[float, float]]:
-
-    params = PRESETS[cfg.preset]
+def refine_segments_by_gaze(
+    video_path: str,
+    segments: List[Tuple[float, float]],
+    cfg: GazeFilterConfig,
+) -> List[Tuple[float, float]]:
 
     cap = cv2.VideoCapture(video_path)
     fps = cap.get(cv2.CAP_PROP_FPS) or 30.0
     step = max(int(fps / cfg.sample_fps), 1)
 
+    base_options = python.BaseOptions(
+        model_asset_path="models/face_landmarker.task"
+    )
+    options = vision.FaceLandmarkerOptions(
+        base_options=base_options,
+        running_mode=vision.RunningMode.IMAGE,
+        num_faces=1,
+    )
+    landmarker = vision.FaceLandmarker.create_from_options(options)
+
     refined = []
 
-    with mp.solutions.face_mesh.FaceMesh(static_image_mode=False) as face_mesh:
+    for seg_start, seg_end in segments:
+        cap.set(cv2.CAP_PROP_POS_MSEC, seg_start * 1000)
 
-        for seg_start, seg_end in segments:
-            cap.set(cv2.CAP_PROP_POS_MSEC, seg_start * 1000)
+        t = seg_start
+        last_yaw = last_pitch = last_t = None
 
-            t = seg_start
-            start_t = seg_start
-            end_t = seg_end
+        active_start = None
+        last_valid_t = None
 
-            last_yaw = last_pitch = last_t = None
-            stable_start = None
+        while t <= seg_end:
+            for _ in range(step - 1):
+                cap.grab()
 
-            entry_bad = 0
-            exit_bad = 0
+            ret, frame = cap.read()
+            if not ret:
+                break
 
-            # 🔑 NEW
-            cooldown_until = seg_start
+            t += step / fps
 
-            while t <= end_t:
-                for _ in range(step - 1):
-                    cap.grab()
+            rgb = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
+            mp_image = mp.Image(
+                image_format=mp.ImageFormat.SRGB,
+                data=rgb,
+            )
 
-                ret, frame = cap.read()
-                if not ret:
-                    break
+            res = landmarker.detect(mp_image)
+            if not res.face_landmarks:
+                continue
 
-                t += step / fps
+            yaw, pitch = estimate_head_pose(res.face_landmarks[0])
 
-                res = face_mesh.process(cv2.cvtColor(frame, cv2.COLOR_BGR2RGB))
-                if not res.multi_face_landmarks:
-                    continue
+            yaw_speed = pitch_speed = 0.0
+            if last_yaw is not None:
+                dt = max(t - last_t, 1e-6)
+                yaw_speed = abs(yaw - last_yaw) / dt
+                pitch_speed = abs(pitch - last_pitch) / dt
 
-                yaw, pitch = estimate_head_pose(res.multi_face_landmarks[0])
+            # --- YAW INERTIA ---
+            yaw_inertia = 5
+            if last_yaw is not None and yaw_speed > 30.0:
+                direction = math.copysign(1.0, yaw - last_yaw)
+                yaw_inertia += direction
 
-                score = gaze_score(
-                    yaw, pitch,
-                    params["yaw_max"],
-                    params["pitch_min"],
-                    params["pitch_max"],
-                )
+            yaw_inertia = max(min(yaw_inertia, 5.0), -5.0)
 
-                # vitesse
-                if last_yaw is not None:
-                    dt = max(t - last_t, 1e-6)
-                    yaw_speed = abs(yaw - last_yaw) / dt
-                    pitch_speed = abs(pitch - last_pitch) / dt
+            reading_like = abs(yaw_inertia) < 1.5
 
-                    if yaw_speed > params["yaw_speed_max"] or pitch_speed > params["pitch_speed_max"]:
-                        score *= params["speed_penalty"]
+            valid = is_valid_gaze(
+                yaw, pitch, yaw_speed, pitch_speed, cfg
+            )
 
-                        # 🔥 fuite rapide → cooldown
-                        cooldown_until = t + cfg.entry_cooldown_s
-                        stable_start = None
+            valid = valid and not reading_like
 
-                last_yaw, last_pitch, last_t = yaw, pitch, t
+            last_yaw, last_pitch, last_t = yaw, pitch, t
 
-                # ENTRY WINDOW
-                if t < cooldown_until:
-                    start_t = t
-                    continue
+            if valid:
+                last_valid_t = t
+                if active_start is None:
+                    active_start = t
+            else:
+                if active_start and last_valid_t:
+                    if t - last_valid_t > cfg.max_invalid_gap_s:
+                        if last_valid_t - active_start >= cfg.min_segment_duration_s:
+                            refined.append((active_start, last_valid_t))
+                        active_start = None
+                        last_valid_t = None
 
-                if (t - seg_start) <= cfg.entry_guard_s:
-                    if score < cfg.entry_score_min:
-                        entry_bad += 1
-                        if entry_bad >= cfg.entry_max_bad_frames:
-                            start_t = t
-                            stable_start = None
-                    continue
-
-                # EXIT WINDOW
-                if (seg_end - t) <= cfg.exit_guard_s:
-                    if score < cfg.exit_score_min:
-                        exit_bad += 1
-                        if exit_bad > cfg.exit_max_bad_frames:
-                            end_t = t
-                            break
-                    else:
-                        exit_bad = 0
-                    continue
-
-                # STABILITÉ
-                if score >= params["score_min"]:
-                    if stable_start is None:
-                        stable_start = t
-                else:
-                    stable_start = None
-
-                if stable_start and (t - stable_start) >= cfg.min_stable_s:
-                    if end_t - start_t >= 0.6:
-                        refined.append((start_t, end_t))
-                    break
+        if active_start and last_valid_t:
+            if last_valid_t - active_start >= cfg.min_segment_duration_s:
+                refined.append((active_start, last_valid_t))
 
     cap.release()
-    return merge_close_segments(refined, cfg.gap_merge_s)
+    return merge_close_segments(refined, cfg.merge_gap_s)
 
 
-def gaze_score(yaw, pitch, yaw_max, pitch_min, pitch_max):
-    yaw_score = max(0.0, 1.0 - abs(yaw) / yaw_max)
-    pitch_score = 1.0 if pitch_min <= pitch <= pitch_max else 0.0
-    return 0.6 * yaw_score + 0.4 * pitch_score
+def is_valid_gaze(yaw, pitch, yaw_speed, pitch_speed, cfg: GazeFilterConfig):
+    if abs(yaw) > cfg.yaw_max_deg:
+        return False
+    if not (cfg.pitch_min_deg <= pitch <= cfg.pitch_max_deg):
+        return False
+    if yaw_speed > cfg.max_yaw_speed_deg_s:
+        return False
+    if pitch_speed > cfg.max_pitch_speed_deg_s:
+        return False
+    return True
 
 
 def estimate_head_pose(landmarks):
-    nose = landmarks.landmark[1]
-    left = landmarks.landmark[33]
-    right = landmarks.landmark[263]
+    nose = landmarks[1]
+    left = landmarks[33]
+    right = landmarks[263]
 
     dx = right.x - left.x
     dy = nose.y - (left.y + right.y) / 2

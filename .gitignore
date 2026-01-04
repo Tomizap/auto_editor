@@ -11,3 +11,4 @@ modules/__pycache__/
 .hf_home/
 .ipynb_checkpoints/
 .venv-backups/
+models/*

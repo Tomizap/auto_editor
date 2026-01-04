@@ -1,35 +1,82 @@
-# --- mise à jour et outils systèmes ---
-sudo apt update && sudo apt install -y ffmpeg git build-essential libsndfile1 libsndfile1-dev
+#!/bin/bash
+set -e
 
-# --- Python venv ---
-python3 -m venv env
+echo "=== SYSTEM SETUP ==="
+
+apt update
+apt install -y \
+  software-properties-common \
+  ffmpeg \
+  git \
+  build-essential \
+  libsndfile1 \
+  libsndfile1-dev \
+  fonts-dejavu-core
+
+echo "=== PYTHON 3.10 (deadsnakes) ==="
+
+add-apt-repository ppa:deadsnakes/ppa -y
+apt update
+apt install -y \
+  python3.10 \
+  python3.10-venv \
+  python3.10-dev
+
+command -v python3.10 >/dev/null || {
+  echo "❌ Python 3.10 introuvable"
+  exit 1
+}
+
+echo "=== PYTHON ENV ==="
+
+rm -rf env
+python3.10 -m venv env
 source env/bin/activate
-pip install --upgrade pip wheel setuptools
 
-# --- Installer PyTorch (CUDA 12.1 example) - ADAPTE si version différente ---
-pip install torch torchvision torchaudio --index-url https://download.pytorch.org/whl/cu121
+pip install --upgrade pip wheel
+pip install "setuptools<81"
 
-# --- Dépendances Python principales ---
-pip install faster-whisper webrtcvad pydub numpy tqdm pysubs2 opencv-python-headless mediapipe
+echo "=== PYTORCH CUDA ==="
+
+pip install torch torchvision torchaudio \
+  --index-url https://download.pytorch.org/whl/cu121
+
+echo "=== CORE PYTHON DEPS ==="
+
+pip install numpy
+pip install tqdm
+pip install pydub
+pip install pysubs2
+pip install webrtcvad
+pip install opencv-python-headless
+pip install mediapipe
+pip install faster-whisper
+
+echo "=== WHISPERX ==="
+
 pip install git+https://github.com/m-bain/whisperx.git
 
-# --- (optionnel mais utile) font, ffmpeg extras ---
-sudo apt install -y fonts-dejavu-core
+echo "=== VERIFY ==="
 
-# Vérification rapide
 python - <<'PY'
-import torch, sys
-print("torch cuda available:", torch.cuda.is_available())
-print("torch version:", torch.__version__)
+import torch
+import mediapipe as mp
+
+print("Python OK")
+print("Torch version:", torch.__version__)
+print("CUDA available:", torch.cuda.is_available())
+print("MediaPipe version:", mp.__version__)
+print("MediaPipe solutions OK:", hasattr(mp, "solutions"))
 PY
 
-# .hf_cache
+echo "=== MODELS ==="
 
-# télécharger les emojis twemoji
-git clone https://github.com/twitter/twemoji.git
-mv twemoji/assets/72x72/* assets/twemoji
-rm -rf twemoji
+mkdir -p models
+wget -O models/face_landmarker.task \
+https://storage.googleapis.com/mediapipe-models/face_landmarker/face_landmarker/float16/1/face_landmarker.task
 
-# forge police
-sudo apt install fontforge python3-fontforge
-fontforge --script tools/build_emoji_font.ff
+
+echo "=== RCLONE ==="
+curl https://rclone.org/install.sh | sudo bash
+
+echo "=== INSTALL COMPLETE ==="
