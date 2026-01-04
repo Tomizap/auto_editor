@@ -6,6 +6,7 @@ from typing import List
 VIDEO_EXTS = {".mp4", ".mov", ".mkv", ".avi"}
 
 
+
 def concat_folder_videos(
     folder: Path,
     out_dir: Path,
