@@ -1,18 +1,14 @@
 # -*- coding: utf-8 -*-
 
 from pathlib import Path
-import re
 
 # ============================================================
 # CONFIG
 # ============================================================
 
-DEFAULT_FONT = "Noto Sans"
+# "mono"  = emojis Unicode classiques (STABLE)
+# "color" = emojis bitmap inline via font custom (EXPÉRIMENTAL)
 EMOJI_MODE = "mono"
-
-DELIMITERS = {",", ".", "!", "?"}
-APOSTROPHES = {"'", "’"}
-MAX_WORDS_PER_VIEW = 6
 
 UNICODE_EMOJIS = {
 
@@ -187,20 +183,12 @@ UNICODE_EMOJIS = {
     "abonne-toi": "✚",
 }
 
+DEFAULT_FONT = "Noto Sans"
+EMOJI_FONT = "Noto Sans"
 
-def normalize_apostrophes(text: str) -> str:
-    """
-    Supprime TOUS les espaces autour des apostrophes.
-    Ex:
-    "t 'aies" → "t'aies"
-    "t' aies" → "t'aies"
-    "t ' aies" → "t'aies"
-    """
-    text = text.replace("’", "'")
-    return re.sub(r"\s*'\s*", "'", text)
 
 # ============================================================
-# EMOJI
+# EMOJI PROVIDER
 # ============================================================
 
 def pick_emoji(word: str) -> str:
@@ -210,176 +198,92 @@ def pick_emoji(word: str) -> str:
             return emoji
     return ""
 
+
+def format_emoji(emoji: str) -> str:
+    """
+    Inline emoji.
+    - mono: unicode emoji directly
+    - color: switch font only for the emoji glyph, then restore DEFAULT_FONT
+    """
+    if not emoji:
+        return ""
+
+    if EMOJI_MODE == "color":
+        # IMPORTANT: \fn expects a FONT NAME, not a style name.
+        return r"{\fn" + EMOJI_FONT + r"}" + emoji + r"{\fn" + DEFAULT_FONT + r"}"
+    else:
+        return emoji
+
+
 # ============================================================
-# NORMALISATION DES MOTS (APOSTROPHES)
+# Merge apostrophe tokens (c ' est → c'est, l' argent → l'argent)
 # ============================================================
 
-
-CLITICS = {"'", "’", "-"}
-
-def normalize_words(words):
-    out = []
+def merge_apostrophe_words(words):
+    """
+    Canonical merge for apostrophes:
+    - normalize ’ → '
+    - remove space tokens
+    - merge: c ' est → c'est
+    - merge: l' argent → l'argent
+    - guarantees NO SPACE around apostrophe
+    """
+    merged = []
     i = 0
 
-    while i < len(words):
-        w = normalize_apostrophes(words[i]["word"])
-
-        # c ' est
-        if i + 2 < len(words) and words[i + 1]["word"] in APOSTROPHES:
-            out.append({
-                "word": w + "'" + words[i + 2]["word"],
-                "start": words[i]["start"],
-                "end": words[i + 2]["end"],
-            })
-            i += 3
-            continue
-
-        # l' argent
-        if w.endswith("'") and i + 1 < len(words):
-            out.append({
-                "word": w + words[i + 1]["word"],
-                "start": words[i]["start"],
-                "end": words[i + 1]["end"],
-            })
-            i += 2
-            continue
-
-        out.append({
-            "word": w,
-            "start": words[i]["start"],
-            "end": words[i]["end"],
-        })
-        i += 1
-
-    return out
-
-
-def normalize_and_merge_apostrophes(words):
-    """
-    Corrige TOUS les cas :
-    - t ' aies -> t'aies   (3 tokens)
-    - t 'aies  -> t'aies   (2 tokens)
-    - t’ aies  -> t'aies
-    - l' argent -> l'argent
-    - l ' argent -> l'argent
-
-    Le point clé : fusionner ENTRE tokens si le suivant commence par "'".
-    """
-    # 1) normalise texte (strip + espaces internes + ’ -> ')
+    # normalize + remove pure spaces
     cleaned = []
     for w in words:
-        txt = w.get("word", "")
+        txt = w.get("word")
         if not txt or not txt.strip():
             continue
-        txt = txt.replace("’", "'")
-        txt = re.sub(r"\s+", " ", txt).strip()
-        # supprime espaces autour de ' DANS le token
-        txt = re.sub(r"\s*'\s*", "'", txt)
-        cleaned.append({**w, "word": txt})
+        cleaned.append({
+            **w,
+            "word": txt.replace("’", "'")
+        })
 
-    # 2) fusion inter-tokens
-    out = []
-    i = 0
     while i < len(cleaned):
         cur = cleaned[i]
         w = cur["word"]
 
-        # Cas: token apostrophe seul
-        if w == "'" and out and i + 1 < len(cleaned):
+        # case: standalone apostrophe
+        if w == "'" and merged and i + 1 < len(cleaned):
+            prev = merged[-1]
             nxt = cleaned[i + 1]
-            out[-1]["word"] = out[-1]["word"] + "'" + nxt["word"]
-            out[-1]["end"] = nxt.get("end", out[-1]["end"])
+
+            prev["word"] = prev["word"] + "'" + nxt["word"]
+            prev["end"] = nxt.get("end", prev["end"])
             i += 2
             continue
 
-        # Cas: token finit par apostrophe (l' + argent)
+        # case: word ending with apostrophe
         if w.endswith("'") and i + 1 < len(cleaned):
             nxt = cleaned[i + 1]
-            out.append({
+            merged.append({
                 **cur,
-                "word": w + nxt["word"].lstrip(),
+                "word": w[:-1] + "'" + nxt["word"],
                 "end": nxt.get("end", cur["end"]),
             })
             i += 2
             continue
 
-        # Cas: token suivant commence par apostrophe ('aies) => fusion "t" + "'aies"
-        if i + 1 < len(cleaned) and cleaned[i + 1]["word"].startswith("'"):
-            nxt = cleaned[i + 1]
-            out.append({
-                **cur,
-                "word": w + nxt["word"].lstrip(),  # colle sans espace
-                "end": nxt.get("end", cur["end"]),
-            })
-            i += 2
-            continue
-        
-        # Cas: token clitique seul ( '  ou  - )
-        if w in CLITICS and out and i + 1 < len(cleaned):
-            nxt = cleaned[i + 1]
-            out[-1]["word"] = out[-1]["word"] + w + nxt["word"]
-            out[-1]["end"] = nxt.get("end", out[-1]["end"])
-            i += 2
-            continue
-
-        # Cas: token suivant commence par clitique  ('aies, -vous)
-        if i + 1 < len(cleaned) and cleaned[i + 1]["word"][:1] in CLITICS:
-            nxt = cleaned[i + 1]
-            out.append({
-                **cur,
-                "word": w + nxt["word"],
-                "end": nxt.get("end", cur["end"]),
-            })
-            i += 2
-            continue
-
-        out.append(cur)
+        merged.append(cur)
         i += 1
 
-    return out
-
-
-def smart_join(tokens):
-    out = ""
-    for t in tokens:
-        if not out:
-            out = t
-        elif t[:1] in CLITICS:
-            out += t
-        else:
-            out += " " + t
-    return out
+    return merged
 
 
 
 
 # ============================================================
-# PORTIONS SYNTAXIQUES
-# ============================================================
-
-def split_portions(words):
-    portions = []
-    current = []
-
-    for w in words:
-        current.append(w)
-        if w["word"][-1:] in DELIMITERS:
-            portions.append(current)
-            current = []
-
-    if current:
-        portions.append(current)
-
-    return portions
-
-# ============================================================
-# ASS GENERATOR
+# MAIN ASS GENERATOR
 # ============================================================
 
 def generate_karaoke_ass_tiktok_punchy(
     aligned: dict,
     out_ass_path: str,
     resolution=(1080, 1920),
+    window: int = 2,
 ):
     W, H = resolution
     out_ass_path = Path(out_ass_path)
@@ -392,6 +296,7 @@ PlayResY: {H}
 [V4+ Styles]
 Format: Name, Fontname, Fontsize, PrimaryColour, SecondaryColour, OutlineColour, BackColour, Bold, Italic, Underline, StrikeOut, ScaleX, ScaleY, Spacing, Angle, BorderStyle, Outline, Shadow, Alignment, MarginL, MarginR, MarginV, Encoding
 Style: Default,{DEFAULT_FONT},86,&H00FFFFFF,&H0000FF00,&H00000000,&H64000000,1,0,0,0,100,100,0,0,1,6,0,2,60,60,200,1
+Style: EmojiInline,{EMOJI_FONT},86,&H00FFFFFF,&H00000000,&H00000000,&H00000000,0,0,0,0,100,100,0,0,1,0,0,2,60,60,200,1
 
 [Events]
 Format: Layer, Start, End, Style, Name, MarginL, MarginR, MarginV, Effect, Text
@@ -407,38 +312,45 @@ Format: Layer, Start, End, Style, Name, MarginL, MarginR, MarginV, Effect, Text
 
     for seg in aligned.get("segments", []):
         raw_words = [w for w in seg.get("words", []) if w.get("word")]
-        words = normalize_and_merge_apostrophes(raw_words)
-        portions = split_portions(words)
+        words = merge_apostrophe_words(raw_words)
 
-        for portion in portions:
-            for idx, active in enumerate(portion):
-                # 🔑 fenêtre centrée sur le mot actif
-                half = MAX_WORDS_PER_VIEW // 2
-                lo = max(0, idx - half)
-                hi = min(len(portion), lo + MAX_WORDS_PER_VIEW)
-                lo = max(0, hi - MAX_WORDS_PER_VIEW)
+        for i, w in enumerate(words):
+            start, end = w["start"], w["end"]
+            if end <= start:
+                continue
 
-                view = portion[lo:hi]
+            lo = max(0, i - window)
+            hi = min(len(words), i + window + 1)
+            chunk = words[lo:hi]
 
-                rendered = []
-                for w in view:
-                    if w is active:
-                        emoji = pick_emoji(w["word"])
-                        rendered.append(
-                            r"{\1c&HFFFFFF&\fscx100\fscy100"
-                            r"\t(0,120,\fscx118\fscy118)}"
-                            + w["word"]
-                            + (" " + emoji if emoji else "")
-                            + r"{\r}"
-                        )
-                    else:
-                        rendered.append(
-                            r"{\1c&H00FF00&}" + w["word"]
-                        )
+            rendered = []
+            dur_ms = int((end - start) * 1000)
+            punch_ms = min(120, dur_ms)
 
-                lines.append(
-                    f"Dialogue: 0,{ts(active['start'])},{ts(active['end'])},Default,,0,0,0,,{smart_join(rendered)}"
-                )
+            for j, cw in enumerate(chunk):
+                txt = cw["word"]
+
+                if lo + j == i:
+                    # emoji UNIQUEMENT sur le mot actif
+                    emoji = pick_emoji(txt) if EMOJI_MODE == "mono" else ""
+                
+                    rendered.append(
+                        r"{"
+                        r"\1c&HFFFFFF&"
+                        r"\fscx100\fscy100"
+                        + rf"\t(0,{punch_ms},\fscx118\fscy118)"
+                        + r"}"
+                        + txt
+                        + (" " + format_emoji(emoji) if emoji else "")
+                        + r"{\r}"
+                    )
+                else:
+                    rendered.append(r"{\1c&H00FF00&}" + txt)
+
+
+            lines.append(
+                f"Dialogue: 0,{ts(start)},{ts(end)},Default,,0,0,0,,{' '.join(rendered)}"
+            )
 
     out_ass_path.parent.mkdir(parents=True, exist_ok=True)
     out_ass_path.write_text(header + "\n".join(lines), encoding="utf-8")

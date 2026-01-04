@@ -88,7 +88,7 @@ def refine_segments_by_gaze(
                 pitch_speed = abs(pitch - last_pitch) / dt
 
             # --- YAW INERTIA ---
-            yaw_inertia = 5
+            yaw_inertia = 3
             if last_yaw is not None and yaw_speed > 30.0:
                 direction = math.copysign(1.0, yaw - last_yaw)
                 yaw_inertia += direction

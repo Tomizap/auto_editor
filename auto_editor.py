@@ -52,8 +52,8 @@ GAZE_CFG = GazeFilterConfig(
     max_pitch_speed_deg_s=135.0,
 
     # Temporal logic — très important
-    min_valid_duration_s=0.15,     # on accepte des regards caméra courts
-    max_invalid_gap_s=0.55,         # on tolère la lecture brève
+    min_valid_duration_s=0.20,     # on accepte des regards caméra courts
+    max_invalid_gap_s=0.70,         # on tolère la lecture brève
     min_segment_duration_s=0.50,    # sécurité anti micro-cuts
 
     # Guards — soft
