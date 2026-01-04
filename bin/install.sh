@@ -1,6 +1,12 @@
 #!/bin/bash
 set -e
 
+echo "=== ARCHITECTURE ==="
+
+mkdir -p input
+mkdir -p output
+mkdir -p config
+
 echo "=== SYSTEM SETUP ==="
 
 apt update
@@ -75,8 +81,19 @@ mkdir -p models
 wget -O models/face_landmarker.task \
 https://storage.googleapis.com/mediapipe-models/face_landmarker/face_landmarker/float16/1/face_landmarker.task
 
-
 echo "=== RCLONE ==="
+
 curl https://rclone.org/install.sh | sudo bash
+
+echo "=== HF_CACHE ==="
+
+mkdir -p /tmp/hf_cache
+export HF_HOME=/tmp/hf_cache
+export HUGGINGFACE_HUB_CACHE=/tmp/hf_cache
+
+echo "=== INSTALL COMPLETE ==="
+
+git config --global user.name "Tom Zapico"
+git config --global user.email "zaptom.pro@gmail.com"
 
 echo "=== INSTALL COMPLETE ==="

@@ -13,6 +13,7 @@ from modules.stt import transcribe_with_words
 from modules.gaze_filter import refine_segments_by_gaze, GazeFilterConfig
 from modules.restart_filter import detect_restarts
 from modules.filler_filter import detect_fillers
+from modules.ffmpeg_utils import nvenc_available
 
 
 # =============================================================================
@@ -48,12 +49,12 @@ GAZE_CFG = GazeFilterConfig(
     pitch_max_deg=28.0,
 
     # Motion — clé pour détecter la lecture
-    max_yaw_speed_deg_s=120.0,
+    max_yaw_speed_deg_s=130.0,
     max_pitch_speed_deg_s=135.0,
 
     # Temporal logic — très important
-    min_valid_duration_s=0.20,     # on accepte des regards caméra courts
-    max_invalid_gap_s=0.70,         # on tolère la lecture brève
+    min_valid_duration_s=0.25,     # on accepte des regards caméra courts
+    max_invalid_gap_s=0.80,         # on tolère la lecture brève
     min_segment_duration_s=0.50,    # sécurité anti micro-cuts
 
     # Guards — soft
@@ -282,20 +283,40 @@ def process_project(
     project_out = OUTPUT_DIR / project_name
     project_out.mkdir(parents=True, exist_ok=True)
 
-    final_out = project_out / f"{project_name}_final.mp4"
+    final_out = project_out / f"{project_name}_final.mp4" 
 
-    subprocess.run([
+    use_nvenc = nvenc_available()
+
+    cmd = [
         "ffmpeg", "-y",
-        "-i", str(concat_mp4),
+        "-i", concat_mp4,
         "-vf", f"subtitles={ass_path}:fontsdir=assets/fonts",
-        "-c:v", "h264_nvenc",
-        "-preset", "p5",
-        "-cq", "19",
-        "-pix_fmt", "yuv420p",
+    ]
+
+    if use_nvenc:
+        cmd += [
+            "-c:v", "h264_nvenc",
+            "-preset", "p5",
+            "-cq", "19",
+            "-b:v", "0",
+            "-pix_fmt", "yuv420p",
+        ]
+    else:
+        cmd += [
+            "-c:v", "libx264",
+            "-preset", "veryfast",
+            "-crf", "19",
+            "-pix_fmt", "yuv420p",
+        ]
+
+    cmd += [
         "-c:a", "aac",
         "-b:a", "160k",
-        str(final_out),
-    ], check=True)
+        final_out
+    ]
+
+    subprocess.run(cmd, check=True)
+
 
     log_step("Final render", t0)
     print(f"\n✅ DONE → {final_out}")
