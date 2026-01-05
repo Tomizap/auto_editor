@@ -1,19 +1,20 @@
-import shutil
 import time
 import subprocess
 from pathlib import Path
-from typing import List, Tuple
 
 from modules.input_concat import concat_folder_videos
 from modules.video_normalize import normalize_video
-from modules.audio_vad import extract_wav_mono16k, vad_segments
-from modules.ffmpeg_utils import cut_segment, concat_segments_single_pass
+from modules.audio_vad import extract_wav_mono16k
+from modules.ffmpeg_utils import concat_segments_single_pass, nvenc_available
 from modules.generate_karaoke_ass import generate_karaoke_ass_tiktok_punchy
 from modules.stt import transcribe_with_words
-from modules.gaze_filter import refine_segments_by_gaze, GazeFilterConfig
-from modules.restart_filter import detect_restarts
-from modules.filler_filter import detect_fillers
-from modules.ffmpeg_utils import nvenc_available
+
+from modules.audio_silence_cuts import (
+    detect_silences_ffmpeg,
+    build_segments_from_silences,
+)
+
+from modules.audio_repetition_filter import apply_repetition_filter
 
 
 # =============================================================================
@@ -30,7 +31,7 @@ TMP_DIR.mkdir(exist_ok=True)
 
 
 # =============================================================================
-# GLOBAL CONFIG
+# CONFIG
 # =============================================================================
 
 DEVICE = "cuda"
@@ -39,79 +40,220 @@ MODEL_NAME = "medium"
 TARGET_W = 1080
 TARGET_H = 1920
 
-GAZE_CFG = GazeFilterConfig(
-    # Sampling
-    sample_fps=4.0,
 
-    # Geometry — permissive (retours caméra fréquents)
-    yaw_max_deg=40.0,
-    pitch_min_deg=-38.0,
-    pitch_max_deg=28.0,
+# =============================================================================
+# AUDIO CUT CONFIG (SILENCE-DRIVEN)
+# =============================================================================
 
-    # Motion — clé pour détecter la lecture
-    max_yaw_speed_deg_s=130.0,
-    max_pitch_speed_deg_s=135.0,
+SILENCE_NOISE_DB = -28.0
+SILENCE_MIN_DUR_S = 0.08
 
-    # Temporal logic — très important
-    min_valid_duration_s=0.25,     # on accepte des regards caméra courts
-    max_invalid_gap_s=0.80,         # on tolère la lecture brève
-    min_segment_duration_s=0.50,    # sécurité anti micro-cuts
+CUT_SILENCE_OVER_S = 0.25
+MERGE_GAP_UNDER_S = 0.18
 
-    # Guards — soft
-    entry_grace_s=0.35,
-    exit_grace_s=0.45,
+PRE_PAD_S = 0.08
+POST_PAD_S = 0.10
 
-    # Merge
-    merge_gap_s=0.45,
-)
+MIN_SEGMENT_S = 0.45
+DROP_SEGMENT_UNDER_S = 0.16
 
 
 # =============================================================================
 # UTILS
 # =============================================================================
 
-def _now() -> float:
-    return time.time()
+def log_step(label: str, t0: float):
+    print(f"✓ {label:<40} {time.time() - t0:6.2f}s")
 
 
-def log_step(label: str, t0: float) -> None:
-    dt = time.time() - t0
-    print(f"✓ {label:<45} {dt:7.2f}s")
+def ffprobe_duration(path: Path) -> float:
+    out = subprocess.check_output([
+        "ffprobe", "-v", "error",
+        "-show_entries", "format=duration",
+        "-of", "default=noprint_wrappers=1:nokey=1",
+        str(path)
+    ])
+    return float(out.decode().strip())
 
 
-def log_header(title: str) -> None:
-    print("\n" + "=" * 90)
-    print(title)
-    print("=" * 90)
+def flatten_words(stt):
+    words = []
+    for seg in stt.get("segments", []):
+        for w in seg.get("words", []):
+            if {"start", "end", "word"} <= w.keys():
+                words.append(w)
+    return words
 
 
-def count_words(aligned: dict) -> int:
-    return sum(len(s.get("words", [])) for s in aligned.get("segments", []))
+def text_for_segments(words, segments, margin_s=0.25):
+    texts = []
+    for s, e in segments:
+        s_ext = s - margin_s
+        e_ext = e + margin_s
+        seg_words = [
+            w["word"]
+            for w in words
+            if w["end"] > s_ext and w["start"] < e_ext
+        ]
+        texts.append(" ".join(seg_words))
+    return texts
 
 
-def is_valid_video(path: Path) -> bool:
-    try:
-        subprocess.run(
-            ["ffmpeg", "-v", "error", "-i", str(path), "-f", "null", "-"],
-            stdout=subprocess.DEVNULL,
-            stderr=subprocess.DEVNULL,
-            check=True,
-        )
-        return True
-    except subprocess.CalledProcessError:
-        return False
+def is_hard_punct(token: str) -> bool:
+    t = token.strip()
+    return len(t) > 0 and t[-1] in {".", "!", "?"}
+
+def is_soft_punct(token: str) -> bool:
+    t = token.strip()
+    return len(t) > 0 and t[-1] in {",", ";", ":"}
+
+def build_punct_segments_from_words(
+    words,
+    max_duration_s: float = 4.0,
+    min_duration_s: float = 0.6,
+    max_gap_s: float = 0.9,
+    allow_soft_punct_split: bool = True,
+):
+    """
+    Build text-aligned segments from word timestamps, cut on punctuation.
+    Returns: (segments, texts) where segments are (start,end).
+    """
+    if not words:
+        return [], []
+
+    segments = []
+    texts = []
+
+    seg_start = None
+    seg_end = None
+    seg_tokens = []
+    last_end = None
+
+    def flush():
+        nonlocal seg_start, seg_end, seg_tokens
+        if seg_start is None or seg_end is None:
+            seg_start, seg_end, seg_tokens = None, None, []
+            return
+        dur = seg_end - seg_start
+        if dur >= min_duration_s and seg_tokens:
+            segments.append((seg_start, seg_end))
+            texts.append(" ".join(seg_tokens).strip())
+        seg_start, seg_end, seg_tokens = None, None, []
+
+    for w in words:
+        if not {"start", "end", "word"} <= w.keys():
+            continue
+
+        ws, we = float(w["start"]), float(w["end"])
+        tok = str(w["word"])
+
+        if seg_start is None:
+            seg_start = ws
+            seg_end = we
+            seg_tokens = [tok]
+            last_end = we
+            continue
+
+        # If there's a big gap, close the current segment (natural boundary)
+        if last_end is not None and (ws - last_end) > max_gap_s:
+            flush()
+            seg_start = ws
+            seg_end = we
+            seg_tokens = [tok]
+            last_end = we
+            continue
+
+        # Append token
+        seg_tokens.append(tok)
+        seg_end = max(seg_end, we)
+        last_end = we
+
+        dur = seg_end - seg_start
+        hard = is_hard_punct(tok)
+        soft = allow_soft_punct_split and is_soft_punct(tok)
+
+        # Cut rules:
+        # 1) always cut on hard punctuation
+        # 2) optionally cut on soft punctuation if segment is getting long
+        # 3) cut if max_duration exceeded (even without punctuation)
+        if hard:
+            flush()
+        elif soft and dur >= (0.65 * max_duration_s):
+            flush()
+        elif dur >= max_duration_s:
+            flush()
+
+    flush()
+    return segments, texts
+
+
+import numpy as np
+import soundfile as sf
+
+
+def segment_rms(wav_path: str, start: float, end: float) -> float:
+    audio, sr = sf.read(wav_path)
+    s = int(start * sr)
+    e = int(end * sr)
+    if e <= s:
+        return 0.0
+    seg = audio[s:e]
+    return float(np.sqrt(np.mean(seg ** 2)))
+
+
+def remove_micro_stutter_segments(
+    segments,
+    wav_path: str,
+    max_seg_dur_s=0.35,
+    max_gap_s=0.15,
+    rms_similarity=0.15,
+):
+    cleaned = []
+    prev = None
+
+    for seg in segments:
+        if prev is None:
+            cleaned.append(seg)
+            prev = seg
+            continue
+
+        s0, e0 = prev
+        s1, e1 = seg
+
+        gap = s1 - e0
+        dur0 = e0 - s0
+        dur1 = e1 - s1
+
+        if (
+            dur0 <= max_seg_dur_s
+            and dur1 <= max_seg_dur_s
+            and gap <= max_gap_s
+        ):
+            rms0 = segment_rms(wav_path, s0, e0)
+            rms1 = segment_rms(wav_path, s1, e1)
+
+            if abs(rms0 - rms1) / max(rms0, rms1, 1e-6) < rms_similarity:
+                # Drop the first micro-stutter segment
+                cleaned[-1] = seg
+                prev = seg
+                continue
+
+        cleaned.append(seg)
+        prev = seg
+
+    return cleaned
+
 
 
 # =============================================================================
 # PROCESS PROJECT
 # =============================================================================
 
-def process_project(
-    video_path: Path,
-    project_name: str,
-) -> None:
+def process_project(video_path: Path, project_name: str):
 
-    log_header(f"🎬 PROCESSING PROJECT: {project_name}")
+    print("\n" + "=" * 60)
+    print(f"🎬 PROCESSING {project_name}")
+    print("=" * 60)
 
     work = TMP_DIR / project_name
     work.mkdir(parents=True, exist_ok=True)
@@ -119,207 +261,196 @@ def process_project(
     # -------------------------------------------------------------------------
     # 1) NORMALIZE
     # -------------------------------------------------------------------------
-    t0 = _now()
+    t0 = time.time()
     normalized = work / "normalized.mp4"
-
-    if normalized.exists() and is_valid_video(normalized):
-        print("▶ Already Cache Normalize video")
-    else:
-        print("▶ Normalize video")
-        normalize_video(str(video_path), str(normalized))
-
+    normalize_video(str(video_path), str(normalized))
     log_step("Normalize video", t0)
-    video_path = normalized
 
     # -------------------------------------------------------------------------
-    # 2) EXTRACT AUDIO (VAD)
+    # 2) EXTRACT AUDIO
     # -------------------------------------------------------------------------
-    t0 = _now()
+    t0 = time.time()
     wav = work / "audio.wav"
-    print("▶ Extract audio (mono / 16kHz)")
-    extract_wav_mono16k(str(video_path), str(wav))
+    extract_wav_mono16k(str(normalized), str(wav))
     log_step("Extract audio", t0)
 
     # -------------------------------------------------------------------------
-    # 3) VAD
+    # 3) AUDIO CUT (SILENCE-BASED)
     # -------------------------------------------------------------------------
-    t0 = _now()
-    print("▶ Voice Activity Detection")
+    t0 = time.time()
+    dur = ffprobe_duration(normalized)
 
-    segments = vad_segments(
+    silences = detect_silences_ffmpeg(
         wav_path=str(wav),
-        aggressiveness=3,
-        frame_ms=20,
-        padding_ms=80,
-        min_segment_ms=300,
-        merge_gap_ms=250,
+        noise_db=SILENCE_NOISE_DB,
+        min_silence_dur_s=SILENCE_MIN_DUR_S,
     )
 
-    segments = [(max(0.0, s - 0.09), e) for s, e in segments]
+    segments_src = build_segments_from_silences(
+        duration_s=dur,
+        silences=silences,
+        cut_silence_over_s=CUT_SILENCE_OVER_S,
+        merge_gap_under_s=MERGE_GAP_UNDER_S,
+        pre_pad_s=PRE_PAD_S,
+        post_pad_s=POST_PAD_S,
+        min_segment_s=MIN_SEGMENT_S,
+        drop_segment_under_s=DROP_SEGMENT_UNDER_S,
+    )
 
-    print(f"  • {len(segments)} segment(s)")
-    log_step("VAD", t0)
+    segments_src = remove_micro_stutter_segments(
+        segments_src,
+        wav_path=str(wav),
+    )
 
-    if not segments:
-        print("⚠ No speech detected → skip")
+    log_step("Silence cut → segments", t0)
+    print(f"  • segments (src): {len(segments_src)}")
+
+    if not segments_src:
+        print("⚠ No segments after silence cut")
         return
 
     # -------------------------------------------------------------------------
-    # 4) GAZE FILTER
+    # 4) CONCAT ROUGH
     # -------------------------------------------------------------------------
-    t0 = _now()
-    print("▶ Gaze filtering")
-
-    segments = refine_segments_by_gaze(
-        video_path=str(video_path),
-        segments=segments,
-        cfg=GAZE_CFG,
-    )
-
-    print(f"  • {len(segments)} segment(s)")
-    log_step("Gaze filter", t0)
-
-    if not segments:
-        return
-
-    # -------------------------------------------------------------------------
-    # 5) STT #1
-    # -------------------------------------------------------------------------
-    t0 = _now()
-    print("▶ STT #1 (cut refinement)")
-
-    stt = transcribe_with_words(
-        audio_path=str(wav),
-        device=DEVICE,
-        model_name=MODEL_NAME,
-    )
-
-    all_words = [
-        w for seg in stt.get("segments", [])
-        for w in seg.get("words", [])
-    ]
-
-    log_step("STT #1", t0)
-
-    # -------------------------------------------------------------------------
-    # 6) RESTART + FILLER FILTER
-    # -------------------------------------------------------------------------
-    t0 = _now()
-    print("▶ Restart & filler filtering")
-
-    clean_segments: List[Tuple[float, float]] = []
-
-    for (start, end) in segments:
-        seg_words = [w for w in all_words if start <= w["start"] <= end]
-
-        cuts = detect_restarts(seg_words) + detect_fillers(seg_words)
-
-        if cuts:
-            last = max(c[1] for c in cuts)
-            if last < end:
-                clean_segments.append((last, end))
-        else:
-            clean_segments.append((start, end))
-
-    segments = clean_segments
-    log_step("Restart & filler filter", t0)
-
-    if not segments:
-        return
-
-    # -------------------------------------------------------------------------
-    # 7) ONE-PASS CONCAT
-    # -------------------------------------------------------------------------
-    t0 = _now()
-    print("▶ One-pass trim+concat")
-
-    concat_mp4 = work / "concat.mp4"
+    t0 = time.time()
+    concat_rough = work / "concat.mp4"
 
     concat_segments_single_pass(
-        src=str(video_path),
-        segments=segments,
-        out=str(concat_mp4),
+        src=str(normalized),
+        segments=segments_src,
+        out=str(concat_rough),
         target_w=TARGET_W,
         target_h=TARGET_H,
         prefer_nvenc=True,
     )
 
-    log_step("One-pass concat", t0)
+    log_step("Concat rough", t0)
 
     # -------------------------------------------------------------------------
-    # 8) STT #2 (SUBTITLES)
+    # 5) STT UNIQUE FOR REPETITIONS
     # -------------------------------------------------------------------------
-    t0 = _now()
-    wav_concat = work / "audio_concat.wav"
-    extract_wav_mono16k(str(concat_mp4), str(wav_concat))
+    t0 = time.time()
+    wav_concat = work / "concat.wav"
+    extract_wav_mono16k(str(concat_rough), str(wav_concat))
 
-    stt_concat = transcribe_with_words(
+    stt = transcribe_with_words(
         audio_path=str(wav_concat),
         device=DEVICE,
         model_name=MODEL_NAME,
     )
 
-    log_step("STT #2", t0)
+    log_step("STT concat (unique)", t0)
 
     # -------------------------------------------------------------------------
-    # 9) SUBTITLES
+    # 6) REPETITION FILTER (ON CONCAT TIMELINE)
     # -------------------------------------------------------------------------
-    t0 = _now()
-    ass_path = work / "subs.ass"
+    t0 = time.time()
+
+    words = flatten_words(stt)
+
+    # Rebuild segments based on punctuation (no margin needed)
+    segments_concat, texts = build_punct_segments_from_words(
+        words,
+        max_duration_s=4.0,
+        min_duration_s=0.6,
+        max_gap_s=0.9,
+        allow_soft_punct_split=True,
+    )
+
+    print("▶ Textual segments (punctuation-based)")
+    for i, (seg, txt) in enumerate(zip(segments_concat, texts)):
+        print(f"{i:02d} {(seg[1]-seg[0]):.2f}s | {txt}")
+
+
+    segments_clean, _ = apply_repetition_filter(
+        segments=segments_concat,
+        texts=texts,
+        lookback=3,
+        min_sim=0.78,
+        min_keep_s=MIN_SEGMENT_S,
+    )
+
+    log_step("Repetition filter", t0)
+    print(f"  • segments (clean): {len(segments_clean)}")
+
+    if not segments_clean:
+        print("⚠ All segments removed by repetition filter")
+        return
+
+    # -------------------------------------------------------------------------
+    # CONCAT CLEAN (AFTER REPETITION CUT)
+    # -------------------------------------------------------------------------
+    t0 = time.time()
+    concat_clean = work / "concat_clean.mp4"
+
+    concat_segments_single_pass(
+        src=str(concat_rough),
+        segments=segments_clean,
+        out=str(concat_clean),
+        target_w=TARGET_W,
+        target_h=TARGET_H,
+        prefer_nvenc=True,
+    )
+
+    log_step("Concat clean", t0)
+
+    # -------------------------------------------------------------------------
+    # STT FINAL (ONLY SOURCE OF TRUTH)
+    # -------------------------------------------------------------------------
+    t0 = time.time()
+
+    wav_clean = work / "concat_clean.wav"
+    extract_wav_mono16k(str(concat_clean), str(wav_clean))
+
+    stt_final = transcribe_with_words(
+        audio_path=str(wav_clean),
+        device=DEVICE,
+        model_name=MODEL_NAME,
+    )
+
+    log_step("STT final (clean)", t0)
+
+    # -------------------------------------------------------------------------
+    # 8) SUBTITLES (ASS)
+    # -------------------------------------------------------------------------
+    t0 = time.time()
+    ass = work / "subs.ass"
 
     generate_karaoke_ass_tiktok_punchy(
-        aligned=stt_concat,
-        out_ass_path=ass_path,
+        aligned=stt_final,
+        out_ass_path=ass,
     )
 
     log_step("Generate subtitles", t0)
 
     # -------------------------------------------------------------------------
-    # 10) FINAL RENDER
+    # 9) FINAL RENDER
     # -------------------------------------------------------------------------
-    t0 = _now()
-    print("▶ Final render")
+    t0 = time.time()
 
-    project_out = OUTPUT_DIR / project_name
-    project_out.mkdir(parents=True, exist_ok=True)
-
-    final_out = project_out / f"{project_name}_final.mp4" 
+    out_dir = OUTPUT_DIR / project_name
+    out_dir.mkdir(exist_ok=True)
+    final_out = out_dir / f"{project_name}_final.mp4"
 
     use_nvenc = nvenc_available()
 
     cmd = [
         "ffmpeg", "-y",
-        "-i", concat_mp4,
-        "-vf", f"subtitles={ass_path}:fontsdir=assets/fonts",
+        "-i", str(concat_clean),
+        "-vf", f"subtitles={ass}:fontsdir=assets/fonts",
+        "-c:a", "aac", "-b:a", "160k",
     ]
 
     if use_nvenc:
-        cmd += [
-            "-c:v", "h264_nvenc",
-            "-preset", "p5",
-            "-cq", "19",
-            "-b:v", "0",
-            "-pix_fmt", "yuv420p",
-        ]
+        cmd += ["-c:v", "h264_nvenc", "-preset", "p5", "-cq", "19", "-b:v", "0"]
     else:
-        cmd += [
-            "-c:v", "libx264",
-            "-preset", "veryfast",
-            "-crf", "19",
-            "-pix_fmt", "yuv420p",
-        ]
+        cmd += ["-c:v", "libx264", "-preset", "veryfast", "-crf", "19"]
 
-    cmd += [
-        "-c:a", "aac",
-        "-b:a", "160k",
-        final_out
-    ]
-
+    cmd.append(str(final_out))
     subprocess.run(cmd, check=True)
 
-
     log_step("Final render", t0)
-    print(f"\n✅ DONE → {final_out}")
+    print(f"✅ DONE → {final_out}")
 
 
 # =============================================================================
@@ -329,39 +460,20 @@ def process_project(
 def main():
     print("\n🚀 AUTO_EDITOR STARTED\n")
 
-    projects = [
-        p for p in INPUT_DIR.iterdir()
-        if p.is_dir() and not p.name.startswith(".")
-    ]
-
-    if not projects:
-        print("⚠ No valid project folders found in input/")
-        return
-
-    print(f"📁 Found {len(projects)} project(s)")
+    projects = [p for p in INPUT_DIR.iterdir() if p.is_dir()]
 
     for project in projects:
         try:
-            t0 = _now()
-
             input_video = concat_folder_videos(
                 folder=project,
                 out_dir=TMP_DIR / "_input_concat"
             )
-
-            log_step("Input concat", t0)
-
-            process_project(
-                video_path=input_video,
-                project_name=project.name,
-            )
-
+            process_project(input_video, project.name)
         except RuntimeError:
-            print(f"\n❌ ERROR on project {project.name}")
+            print(f"❌ ERROR on project {project.name}")
             continue
-
         except Exception:
-            print(f"\n❌ ERROR on project {project.name}")
+            print(f"❌ ERROR on project {project.name}")
             raise
 
 

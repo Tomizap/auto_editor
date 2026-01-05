@@ -1,61 +1,61 @@
-from typing import Dict, Any, List
+from typing import Dict, Any, List, Optional
 
-def transcribe_with_words(audio_path: str, device: str = "cuda", model_name: str = "medium") -> Dict[str, Any]:
-    """
-    Returns dict with:
-      {"segments":[{"start","end","text","words":[{"word","start","end"}...]}...]}
-    Strategy:
-      1) Try whisperx (if installed) for alignment
-      2) Else fallback to faster-whisper word_timestamps=True
-    """
-    # 1) Try whisperx
+STT_PROMPT = (
+    "Vidéo de conseil sur l'alternance et le recrutement. "
+    "On parle de LinkedIn, entreprise, recruteur, candidat, "
+    "motivation, entretien, expérience professionnelle, tuteur."
+)
+
+
+def resolve_whisper_device(requested: str) -> tuple[str, str]:
+    if requested != "cuda":
+        return "cpu", "int8"
+
     try:
-        import whisperx  # type: ignore
-        # whisperx expects audio array; simplest: use whisperx.load_audio on video/audio path
-        audio = whisperx.load_audio(audio_path)
-        model = whisperx.load_model(model_name, device=device, compute_type="float16" if device == "cuda" else "int8")
-        result = model.transcribe(audio, batch_size=16)
-
-        # Align to get word-level
-        # language may be None if auto; whisperx requires language code
-        lang = result.get("language", "en")
-        align_model, metadata = whisperx.load_align_model(language_code=lang, device=device)
-        aligned = whisperx.align(result["segments"], align_model, metadata, audio, device, return_char_alignments=False)
-
-        # normalize format
-        segments = []
-        for seg in aligned["segments"]:
-            words = seg.get("words", []) or []
-            segments.append({
-                "start": float(seg["start"]),
-                "end": float(seg["end"]),
-                "text": seg.get("text", "").strip(),
-                "words": [
-                    {
-                        "word": (w.get("word") or "").strip(),
-                        "start": float(w["start"]) if w.get("start") is not None else float(seg["start"]),
-                        "end": float(w["end"]) if w.get("end") is not None else float(seg["end"]),
-                    }
-                    for w in words
-                    if (w.get("word") or "").strip()
-                ],
-            })
-        return {"segments": segments}
-
+        import torch
+        if torch.cuda.is_available():
+            return "cuda", "float16"
     except Exception:
         pass
 
-    # 2) faster-whisper fallback
-    from faster_whisper import WhisperModel  # type: ignore
+    print("  ⚠ CUDA unavailable → fallback to CPU")
+    return "cpu", "int8"
 
-    compute_type = "float16" if device == "cuda" else "int8"
-    model = WhisperModel(model_name, device=device, compute_type=compute_type)
+
+def transcribe_with_words(
+    audio_path: str,
+    device: str = "cuda",
+    model_name: str = "medium",
+    initial_prompt: str = STT_PROMPT,
+) -> Dict[str, Any]:
+    """
+    Whisper VERBATIM :
+    - aucune suppression d'hésitation
+    - word-level timestamps
+    - SAFE CPU / CUDA
+    - optional initial prompt for context biasing
+    """
+
+    from faster_whisper import WhisperModel
+
+    device, compute_type = resolve_whisper_device(device)
+
+    model = WhisperModel(
+        model_name,
+        device=device,
+        compute_type=compute_type,
+    )
 
     segments_out: List[Dict[str, Any]] = []
-    segments, _info = model.transcribe(
+
+    # ------------------------------------------------------------
+    # Transcription with optional context prompt
+    # ------------------------------------------------------------
+    segments, _ = model.transcribe(
         audio_path,
         word_timestamps=True,
-        vad_filter=False
+        vad_filter=False,        # CRITIQUE : on ne touche pas à l'audio
+        initial_prompt=initial_prompt,
     )
 
     for seg in segments:
@@ -64,15 +64,16 @@ def transcribe_with_words(audio_path: str, device: str = "cuda", model_name: str
             for w in seg.words:
                 if (w.word or "").strip():
                     words.append({
-                        "word": w.word.strip(),
+                        "word": w.word,
                         "start": float(w.start),
                         "end": float(w.end),
                     })
+
         segments_out.append({
             "start": float(seg.start),
             "end": float(seg.end),
-            "text": (seg.text or "").strip(),
-            "words": words
+            "text": seg.text or "",
+            "words": words,
         })
 
     return {"segments": segments_out}
